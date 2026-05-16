@@ -4,6 +4,7 @@
 # In[ ]:
 
 
+import argparse
 import tflearn
 import tensorflow as tf
 import numpy as np
@@ -16,6 +17,11 @@ from pydub import AudioSegment
 from collections import deque
 from zipfile import ZipFile
 
+try:
+    tf.compat.v1.disable_eager_execution()
+except Exception:
+    pass
+
 def main():
     
     '''
@@ -25,14 +31,20 @@ def main():
     3.将音符数据转换成OSU对应的文件格式，打包为osz文件
     '''
     
-    if len(sys.argv) < 2:
-        print("Usage: output.py song_file.mp3")
-        return
+    parser = argparse.ArgumentParser()
+    parser.add_argument("song_file")
+    parser.add_argument("--model-dir", default="model_sigmoid_multi")
+    parser.add_argument("--legacy-arch", dest="legacy_arch", action="store_true")
+    parser.add_argument("--modern-arch", dest="legacy_arch", action="store_false")
+    parser.set_defaults(legacy_arch=True)
+    parser.add_argument("--threshold", type=float)
+    parser.add_argument("--lstm-activation", choices=["relu", "tanh"], default="relu")
+    args = parser.parse_args()
 
-    dir_name = sys.argv[1] + " chunks"
+    dir_name = args.song_file + " chunks"
 
-    songfile = sys.argv[1]
-    song = sys.argv[1][:len(sys.argv[1]) - 4]
+    songfile = args.song_file
+    song = args.song_file[:len(args.song_file) - 4]
     npy_file = song + " Input.npy"
     outfile = song + " Archetype.osu"
     package = song + " Archetype.osz"
@@ -48,7 +60,14 @@ def main():
     analyze_song(npy_file, dir_name)
 
     print("Making predictions..")
-    make_predictions(npy_file, outfile)
+    make_predictions(
+        npy_file,
+        outfile,
+        model_dir=args.model_dir,
+        legacy_arch=args.legacy_arch,
+        threshold=args.threshold,
+        lstm_activation=args.lstm_activation,
+    )
 
     print("Packing up your beatmap..")
     #create_osz(songfile, outfile, package)
@@ -159,77 +178,23 @@ def analyze_song(file_name = None, dir_name = None):
         np.save(file_name, feats_list)
         return
         
-def make_predictions(npy_file=None, outfile=None):
+def make_predictions(npy_file=None, outfile=None, model_dir="model_sigmoid_multi", legacy_arch=True, threshold=None, lstm_activation="relu"):
     '''
     Makes note predictions using the given song data (npy_file), then calls create_chart to... create the chart!
     '''
 
-    ### importing model for predictions ###
-    
-    # unpack the input data
-    net = tflearn.input_data([None, 1560])
-    song = tf.slice(net, [0,0], [-1, 1440])
-    song = tf.reshape(song, [-1, 90, 16])
-    prev_notes = tf.slice(net, [0,1440], [-1, 120])
-    prev_notes = tf.reshape(prev_notes, [-1, 8, 15])
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    from model_sigmoid_pro import build_network
 
-    # 转置一下保证输入格式正确（交换2轴和3轴）
-    song_trans = tf.transpose(song, perm=[0, 2, 1])
-    prev_notes_trans = tf.transpose(prev_notes, perm=[0, 2, 1])
-    print(song_trans.shape, "song_trans shape before input")
-    print(prev_notes_trans.shape, "prev_notes_trans shape before input")
-    
-    # two conv layers with a 20% dropout layer after the first and max_pooling after each
-    song_encoder = tflearn.conv_1d(song_trans, nb_filter=16, filter_size=3, activation="relu")
-    song_encoder = tflearn.max_pool_1d(song_encoder, kernel_size=3)
-    song_encoder = tflearn.dropout(song_encoder, keep_prob=0.8)
-
-    song_encoder = tflearn.conv_1d(song_trans, nb_filter=32, filter_size=3, activation="relu")
-    song_encoder = tflearn.max_pool_1d(song_encoder, kernel_size=1)
-
-    song_encoder = tflearn.fully_connected(song_encoder, n_units=128, activation="relu")
-    song_encoder = tf.reshape(song_encoder, [-1,16,8])
-
-    # split song data into past chunks and current chunk
-    past_chunks = tf.slice(song_encoder, [0,0,0], [-1, 15, 8])
-    curr_chunk = tf.slice(song_encoder, [0,15,0], [-1, 1, 8])
-
-    # combine note data with processed song data
-    # lstm_input = tf.unstack(past_chunks, axis=1)
-    lstm_input = tf.math.multiply(past_chunks, prev_notes_trans)
-    # lstm_input = tf.reshape(lstm_input, [-1]) # flatten this to add on the current chunk
-    
-    # add on the final segment which does not have data yet
-    curr_chunk = tf.math.multiply(curr_chunk, tf.ones([1, 8]))
-    # curr_chunk = tf.reshape(curr_chunk, [-1])
-    lstm_input = tf.concat([lstm_input, curr_chunk], 1)
-
-    # lstm_input = tf.reshape(lstm_input, [-1, 16, 8]) # reshape to desired shape
-    
-    # 2 lstm layers, then a final fully connected softmax layer
-    lstm_input = tflearn.lstm(lstm_input, 64, dropout=0.6, activation="relu")
-    lstm_input = tf.reshape(lstm_input, [-1, 8, 8])
-
-    lstm_input = tflearn.lstm(song_encoder, 64, dropout=0.6, activation="relu")
-
-    lstm_input = tflearn.fully_connected(lstm_input, n_units=32, activation="sigmoid")
-    lstm_input = tflearn.reshape(lstm_input, [-1,4,8])
-
-    # setting up final parameters
-    network = tflearn.regression(lstm_input, optimizer = "adam", loss="binary_crossentropy", learning_rate=0.0000001, batch_size=128)
-    model = tflearn.DNN(network, checkpoint_path="model_sigmoid_multi/model_rt.tfl")
-
-    cwd = os.getcwd()
-    model_dir = cwd + "/model_sigmoid_multi"
-    os.chdir(model_dir)
-    model.load("model.tfl")
-    os.chdir(cwd)
+    network = build_network(legacy_arch=legacy_arch, learning_rate=1e-4, lstm_activation=lstm_activation)
+    model = tflearn.DNN(network, checkpoint_path=os.path.join(model_dir, "model_rt.tfl"))
+    model.load(os.path.join(model_dir, "model.tfl"))
 
     # load the song data from memory map and reshape appropriately        
     song_mm = np.load(npy_file, mmap_mode="r")
-    song_data = np.frombuffer(buffer=song_mm, dtype=np.float32, count=-1)
-    song_data = song_data[0:song_mm.shape[0]*song_mm.shape[1]]
-    song_data = np.reshape(song_data, song_mm.shape)
+    song_data = np.asarray(song_mm, dtype=np.float32)
     
     # create the given song chunk
     # predict for the current song chunk
@@ -263,6 +228,8 @@ def make_predictions(npy_file=None, outfile=None):
         input_chunk = np.concatenate([song, note_data])
         input_chunk = np.expand_dims(input_chunk, axis=0)
         p = model.predict(input_chunk)
+        if threshold is not None:
+            p = (np.asarray(p) >= threshold).astype(np.float32)
         note_queue.popleft()
         predictions.append(p[0])
         note_queue.append(p[0][0])
@@ -444,4 +411,3 @@ def create_osz(songfile, outfile, package):
 
 
 main()
-
